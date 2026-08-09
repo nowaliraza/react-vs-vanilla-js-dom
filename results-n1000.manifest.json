@@ -1,0 +1,50 @@
+{
+  "generatedAt": "2026-08-09T10:15:15.000Z",
+  "command": "node scripts/headless.js --rows 1000 --iterations 10 --rotations 5 --repeat 2 --csv results-n1000.csv",
+  "rows": 1000,
+  "iterations": 10,
+  "warmup": 3,
+  "rotations": 5,
+  "processes": 2,
+  "cpuThrottle": 1,
+  "memo": false,
+  "matrix": false,
+  "samplesPerCell": 100,
+  "scenarioOrderPerProcess": [
+    [
+      "create",
+      "noop",
+      "update1",
+      "update10th",
+      "swap",
+      "insertHead",
+      "removeOne",
+      "replaceAll"
+    ],
+    [
+      "replaceAll",
+      "removeOne",
+      "insertHead",
+      "swap",
+      "update10th",
+      "update1",
+      "noop",
+      "create"
+    ]
+  ],
+  "viewport": "1440x900",
+  "chrome": "Chrome/145.0.7632.159",
+  "react": "19.2.8",
+  "node": "v22.12.0",
+  "os": {
+    "platform": "linux",
+    "release": "6.8.0-136-generic",
+    "arch": "x64",
+    "cpu": "13th Gen Intel(R) Core(TM) i7-1355U"
+  },
+  "files": {
+    "csv": "results-n1000.csv",
+    "raw": "results-n1000.raw.json"
+  },
+  "note": "Repeated runs are separate runs on the same machine, not independent replications."
+}

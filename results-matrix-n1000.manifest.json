@@ -1,0 +1,62 @@
+{
+  "generatedAt": "2026-08-09T10:20:48.672Z",
+  "command": "node scripts/headless.js --matrix --rotations 5 --repeat 2 --iterations 6 --rows 1000 --csv results-matrix-n1000.csv",
+  "rows": 1000,
+  "iterations": 6,
+  "warmup": 3,
+  "rotations": 5,
+  "processes": 2,
+  "cpuThrottle": 1,
+  "memo": false,
+  "matrix": true,
+  "samplesPerCell": 60,
+  "scenarioOrderPerProcess": [
+    [
+      "text-one",
+      "text-all",
+      "attribute-one",
+      "attribute-all",
+      "className-one",
+      "className-all",
+      "style-one",
+      "style-all",
+      "badgeAdd-one",
+      "badgeAdd-all",
+      "badgeRemove-one",
+      "badgeRemove-all",
+      "type-one",
+      "type-all"
+    ],
+    [
+      "type-all",
+      "type-one",
+      "badgeRemove-all",
+      "badgeRemove-one",
+      "badgeAdd-all",
+      "badgeAdd-one",
+      "style-all",
+      "style-one",
+      "className-all",
+      "className-one",
+      "attribute-all",
+      "attribute-one",
+      "text-all",
+      "text-one"
+    ]
+  ],
+  "viewport": "1440x900",
+  "chrome": "Chrome/145.0.7632.159",
+  "react": "19.2.8",
+  "node": "v22.12.0",
+  "os": {
+    "platform": "linux",
+    "release": "6.8.0-136-generic",
+    "arch": "x64",
+    "cpu": "13th Gen Intel(R) Core(TM) i7-1355U"
+  },
+  "files": {
+    "csv": "results-matrix-n1000.csv",
+    "raw": "results-matrix-n1000.raw.json"
+  },
+  "note": "Repeated runs are separate runs on the same machine, not independent replications."
+}

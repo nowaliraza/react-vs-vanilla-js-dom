@@ -1,0 +1,1011 @@
+# Virtual DOM dissection
+
+A small experiment that answers one question with actual measurements:
+
+> **When React updates the screen, where does the time go — and how much of that
+> work was avoidable?**
+
+It is deliberately not a framework benchmark. There is no leaderboard and no
+hundred libraries. There is React, three hand-written reference points, and a
+set of instruments measuring React's update pipeline from the outside.
+
+If you read one section, read **§7.9** — the mutation matrix. It is the
+publication-grade result: in this workload, React's additional cost above the
+keyed JavaScript baseline did not scale strongly with mutation count or category.
+
+---
+
+## 1. Start here: the claim we are testing
+
+You have probably heard some version of this:
+
+> "React is fast because the virtual DOM lets it update only what changed,
+> instead of touching the whole page."
+
+Half of that sentence is true and half is misleading, and the experiment is built
+to separate the halves.
+
+The **true** half: for the value updates, insertions and removals tested here,
+React lands on the exact minimum set of DOM changes. (Reorders are the
+documented exception — §7.4.)
+
+The **misleading** half: "fast" implies faster than hand-written DOM code.
+Whether that is true depends entirely on *which* hand-written code. React beats
+naive rebuilding in this experiment (§7.3), but it is slower than code that
+already knows what changed. There is no single "vanilla JS" baseline.
+
+So "is React faster than vanilla JS?" has no single answer. The more useful
+question is:
+
+> **How much do you pay for the convenience of not having to know what changed —
+> and what exactly are you buying with it?**
+
+That is a number. This repo measures it.
+
+---
+
+## 2. Running it
+
+```bash
+npm install
+npm run measure
+```
+
+Before trusting any number in this document, run:
+
+```bash
+npm run verify     # ~15 seconds
+```
+
+That checks the production build, the 22-scenario fairness gate (at N=1,000),
+and a headless smoke run, and it fails on exit status rather than on output that
+merely looks complete. It exists because a nonzero exit was waved through here
+once already.
+
+Then open <http://localhost:4173>.
+
+`npm run measure` builds the app first and then serves it. **This matters.** If
+you run `npm run dev` instead, you get React's *development* build, which is
+several times slower because it carries extra warnings and safety checks. The
+page shows a red warning banner when this happens, so you cannot measure the
+wrong thing by accident.
+
+Once the page is open, click **Run all scenarios**. It takes about a minute.
+
+| Control | What it does |
+| --- | --- |
+| `rows` | How many rows in the list (100 → 10,000) |
+| `iterations` | How many times each measurement is repeated |
+| `warmup` | Throwaway runs before recording, so JIT warm-up isn't measured |
+| `React.memo rows` | Wraps the row component in `React.memo` — see §7.6 |
+| `op breakdown` | Splits the DOM-operation count into adds / removes / attributes / text |
+
+Three buttons worth knowing: **Run all scenarios** (the standard tables),
+**Mutation matrix** (§7.9 — exploratory single-order version of the headline
+result), and **Scope staircase** (§7.7). The **Why keys exist** panel at the
+bottom needs no run; type in it.
+
+There is also a scripted runner if you want repeatable numbers or CPU throttling:
+
+```bash
+node scripts/headless.js --rows 5000 --throttle 4 --csv out.csv
+```
+
+### Reproducing the datasets
+
+From a clean checkout, install the locked dependencies and run both publication
+commands:
+
+```bash
+npm ci                 # exact locked dependencies (Node >= 20)
+npm run standard       # results-n1000.csv + raw samples + manifest, ~4 min
+npm run matrix         # results-matrix-n1000.csv + raw samples + manifest, ~6 min
+```
+
+The runners auto-detect Chrome/Chromium; set `CHROME_BIN=/path/to/chrome` or
+pass `--chrome` if yours lives elsewhere. Each CSV ships with `<name>.raw.json`
+and `<name>.manifest.json`, which record the raw samples and run environment.
+
+---
+
+## 3. The five contestants
+
+All five produce **exactly the same HTML**. A row looks like this:
+
+```html
+<div class="row" data-id="42" data-status="ready">
+  <span class="rid">42</span>
+  <span class="label" style="color: rgb(139, 149, 165);">pretty red chair</span>
+  <!-- plus, when row.badge is true: --> <span class="badge">new</span>
+</div>
+```
+
+(The attribute, inline style, optional badge and swappable label tag exist for
+the mutation matrix (§7.9) — each is a distinct kind of DOM change.)
+
+Because the output is identical, any difference in cost is a difference in *how
+they got there* — never a difference in what they built. That is the control that
+makes the comparison mean anything.
+
+### 3.1 `vanilla JS · rebuild`
+
+Builds one big HTML string and assigns it:
+
+```js
+container.innerHTML = '<div class="row">…</div><div class="row">…</div>…'
+```
+
+This is how a lot of real hand-written DOM code actually works. It is simple, and
+for building a list from scratch it is genuinely fast. But it throws away every
+existing element and re-creates all of them, **even if only one word changed**.
+
+**Think of it as: the naive rebuild baseline.**
+
+### 3.2 `vanilla JS · keyed diff`
+
+Receives **exactly what React receives**: the next state array, nothing else. It
+has to discover the changes itself — the same job React's reconciler does, with
+the same information — using an id → node map and a single-pass keyed walk.
+
+This is the apples-to-apples row, and the first version of this experiment was
+missing it. Without it you are only comparing React against a strategy that
+doesn't try (`rebuild`) and one that isn't allowed to try (`targeted`).
+
+The gap between this and React is not "the cost of the virtual DOM". Both are
+reconciling. It is the cost of React's **component model** on top of
+reconciliation: running component functions, allocating element objects,
+maintaining fibers.
+
+**Think of it as: the same-information keyed baseline — hand-written JavaScript under React's exact input contract.**
+
+### 3.3 `vanilla JS · targeted`
+
+Keeps a `Map` of row id → the elements for that row, and changes only the
+elements that need changing. No rebuilding, no searching the document.
+
+There is one artificial thing about it, and it matters: it is **handed the
+change** rather than working it out. For "update 1 row", the harness produces
+two things:
+
+```js
+// the new state — this is what React receives
+next = { rows: [ …1000 rows, one of which has a new label… ] }
+
+// the change, spelled out — this is what targeted vanilla JS receives
+ops = [ { t: 'text', id: 1000501, field: 'label', value: 'expensive white house !!!' } ]
+```
+
+React gets `next` and has to *discover* that row 500, with id `1000501`, changed.
+Targeted vanilla JS gets `ops`, and its entire work is one line:
+
+```js
+refs.get(1000501).labelEl.firstChild.nodeValue = op.value
+```
+
+One map lookup, one property write. Its median often falls below the timer's
+visible resolution and is displayed as 0.00 ms.
+
+**Why measure something that was given the answer?** Because it turns "the
+theoretical minimum" into a row that actually ran. I calculate a minimum for each
+scenario on paper (the *floor*), but a calculation proves nothing — I could have
+got the arithmetic wrong. This strategy runs under identical conditions to
+everyone else, and when it lands exactly on the floor every time, the paper
+number and a working implementation agree.
+
+**Is being handed the change cheating?** For a React-shaped architecture, yes —
+React has no way to know what changed without looking. But some reactive systems
+track dependencies when values are read, allowing later updates to notify a
+narrower part of the UI directly.
+
+So read this row two ways: as the floor, and as the shape of an addressed update.
+This project does not measure fine-grained reactive frameworks. Even a
+dependency-tracking runtime cannot discover a changed row inside a
+wholesale-replaced array for free.
+
+**Think of it as: the floor under a different information contract.**
+
+### 3.4 and 3.5 `react · key={row.id}` and `react · key={index}`
+
+The same React component, rendered twice, with **one character different**:
+
+```jsx
+<Row key={row.id} … />     // keyed:  identity travels with the row
+<Row key={i} … />          // index:  identity is glued to the position
+```
+
+This is the single most instructive comparison in the whole experiment, and §7.5
+is about what it reveals.
+
+---
+
+## 4. The eight scenarios
+
+Each scenario is a before → after state change, applied to a list of N rows.
+
+| Scenario | What changes | Minimum possible DOM work |
+| --- | --- | --- |
+| Create N rows | empty → full list | N nodes inserted |
+| **Re-render, nothing changed** | new row objects, identical values | **0** |
+| Update 1 row | one label, mid-list | 1 text write |
+| Update every 10th row | N/10 labels | N/10 text writes |
+| Swap 2 rows | positions 1 and N-2 trade places | 4 (two moves) |
+| Insert at head | one new row prepended | 1 node inserted |
+| Remove 1 row | row at index 1 deleted | 1 node removed |
+| Replace all rows | entirely new data and new ids | 2N (N removals + N insertions) |
+
+Beyond these eight, the **mutation matrix** (§7.9) varies a different axis
+entirely: not how much changed, but what *kind* of DOM change is required —
+text, attribute, class, style, conditional child in and out, and element type,
+each at one row and every row.
+
+**Re-render, nothing changed** is the purest measurement in the set: React runs
+every component, reconciles every node, and then has nothing to do. All cost, no
+DOM work. It is React's render/reconciliation cost with everything else subtracted out.
+
+**Swap**, **Insert at head** and **Remove** are where "which key did you use?"
+stops being a style question.
+
+> A note on "minimum". A *move* in the DOM is not one operation. There is no
+> "move" API — you remove the node and insert it elsewhere. So a browser observer
+> sees 2 operations per moved node. That is why swapping two rows has a floor of
+> 4, not 2.
+
+---
+
+## 5. The two rulers
+
+The experiment measures with two completely different instruments, because they
+have opposite strengths.
+
+### Ruler 1 — counting DOM operations (exact)
+
+A [`MutationObserver`](https://developer.mozilla.org/en-US/docs/Web/API/MutationObserver)
+watches the container and records every change to the live page: nodes added,
+nodes removed, attributes written, text written. We add them up.
+
+**This is the good ruler.** It produces an integer. It is identical on every run,
+on every machine, on a fast laptop or a slow phone. It needs no averages, no
+percentiles, no statistics at all. When the table says React did 1 operation
+where the rebuild strategy did 2000, that is not an estimate — it is a count.
+
+It answers: **how much of the work was necessary?**
+
+**It runs in its own pass.** Attaching a MutationObserver is not free — measured
+here it adds 0.2–0.7 ms, which is small in absolute terms but up to a quarter of
+React's update-one-row figure, the headline number. So the harness runs each
+strategy twice: a timing pass with the observer detached, and an instrumentation
+pass whose times are thrown away. Counting and timing never happen in the same
+measurement.
+
+One thing to understand about it: if a strategy builds elements *before* putting
+them on the page and then attaches the finished piece in one go, the observer
+only sees the final attach. That is not a blind spot in the ruler — it is exactly
+the optimisation being rewarded. It's why "create 1000 rows" costs 1000
+operations rather than 3000, even though 3000 elements were created.
+
+### Ruler 2 — timing (noisy)
+
+`performance.now()` runs around the update. Times drift with CPU temperature,
+garbage collection, and background processes, so results are reported as a
+median (`p50`) with a p95 alongside.
+
+The publication datasets pool 100 samples per standard cell and 60 per matrix
+cell. The exploratory UI defaults to 25 samples in one starting order.
+
+It answers: **how long did the necessary work take?**
+
+You need both. Operation counts tell you whether a strategy is doing something
+stupid. Timing tells you whether it matters.
+
+---
+
+## 6. Reading a results table
+
+Here is a real row, for **Update 1 row** at N=1000:
+
+```text
+strategy                    ops   vs floor   script   render   commit   tail   layout   total   e2e
+react · key={row.id}          1      ×1.00     1.70     1.10     0.60   0.00     0.55    2.30  14.00
+```
+
+(From `results-n1000.csv`, generated by `npm run standard`.)
+
+| Column | Meaning |
+| --- | --- |
+| **ops** | DOM operations performed. Here: 1. |
+| **vs floor** | How many times the minimum. `×1.00` means it did the theoretical minimum — perfect. |
+| **script** | Total time in JavaScript, in milliseconds. For React, `render`, `commit`, and `tail` break it down. |
+| **render** | React calling component functions and reconciling their output. It includes more than virtual DOM comparison. |
+| **commit** | React's commit phase, including the required DOM writes. |
+| **tail** | Work after the commit marker and before the synchronous update returns. |
+| **layout** | The forced browser style and layout flush. It sits outside `script`. |
+| **total** | For each sample, `script + layout`; the table reports the median of those paired sums. |
+| **e2e** | Start of the update until the frame carrying it has been presented. Quantised to the frame boundary, so it answers "did this fit in a frame?" rather than "how much work was it". |
+
+So this row says React performed exactly one DOM operation, which is the minimum.
+Its render phase took 1.10 ms and its commit phase took 0.60 ms. The render phase
+includes component execution and reconciliation, so the experiment cannot assign
+all 1.10 ms to the virtual DOM alone.
+
+### Why `layout` is its own column — and why it is not the same for everyone
+
+An earlier version of this document claimed that because all five strategies
+produce identical HTML, the browser's layout work is identical for all of them,
+so folding layout into a single total would flatten the comparison.
+
+**That was wrong, and this repo's own dataset disproves it.** Update one row in a
+list of 1000:
+
+| Strategy | script | layout | total |
+| --- | --- | --- | --- |
+| vanilla JS · rebuild | 6.20 | **19.80** | **26.90** |
+| vanilla JS · keyed diff | 0.70 | 0.60 | 1.20 |
+| vanilla JS · targeted | 0.00 | 0.60 | 0.60 |
+| react · key={row.id} | 1.70 | **0.55** | **2.30** |
+
+The browser re-lays-out what was **invalidated**, not what exists. The final tree
+is identical in every row of that table; the invalidation is not. Replacing every
+node dirties everything and costs 19.80 ms of layout. Writing one text node
+dirties almost nothing and costs 0.55 ms — about 36× apart.
+
+The correction runs in the opposite direction to my original reasoning. Including
+layout does not flatter the churning strategies — it **convicts** them. Measured
+on script alone, React looks ~4× better than a rebuild. Measured on script +
+forced layout, it is ~12× better. Reporting script only was understating
+React's advantage over the naive hand-written baseline by a large factor.
+
+So **`total` (script + forced layout) is the primary comparison metric**, and the
+density chart plots it rather than script. Because `total` is calculated for
+each sample before taking the median, it may not equal the displayed script
+median plus the displayed layout median.
+
+## 7. What we found
+
+All numbers below: N = 1000 rows, production React 19.2, medians. There are two
+evidence tiers, and every section names its tier:
+
+**Publication evidence** — the standard tables (§7.1–§7.5) and the mutation
+matrix (§7.9–§7.10). Regenerated by `npm run standard` and `npm run matrix`
+under the current harness: balanced strategy rotations, alternating scenario
+order between fresh Chrome processes, pinned 1440×900 viewport. Raw samples and
+a run manifest sit next to each CSV.
+
+**Exploratory observations** — §7.6 (memo), §7.7 (scope staircase), §7.8
+(density sweep). Single strategy order, measured under an earlier harness
+geometry. Their exact figures are historical and cannot be reproduced by any
+current command; they illustrate mechanisms and no headline conclusion rests on
+them.
+
+### 7.1 React matches the mutation minimum on these operations
+
+| Scenario | floor | react keyed did |
+| --- | --- | --- |
+| Update 1 row | 1 op | **1 op** |
+| Update every 10th row | 100 ops | **100 ops** |
+| Insert at head | 1 op | **1 op** |
+| Remove 1 row | 1 op | **1 op** |
+
+On the value updates, insertions, and removals in this table, React performs no
+extra DOM mutations. It matches a hand-written implementation that was handed
+the answer in advance.
+
+Compare the rebuild strategy on the same scenarios. It does 2000 operations every
+time regardless of what changed. So the popular claim *is* true — React updates
+only what changed here. The catch is what it costs to know that.
+
+### 7.2 The render/reconciliation cost, with everything else subtracted out
+
+"Re-render, nothing changed" — every row object replaced, every value identical.
+N = 1000:
+
+| Strategy | DOM ops | script |
+| --- | --- | --- |
+| vanilla JS · rebuild | 2000 | 6.10 ms |
+| vanilla JS · keyed diff | **0** | **0.70 ms** |
+| vanilla JS · targeted | 0 | 0.00 ms |
+| react · key={row.id} | **0** | **2.20 ms** |
+
+React performs zero DOM operations — correct, nothing changed — and spends
+2.20 ms establishing that. The hand-written keyed diff reaches the same
+conclusion from the same input in 0.70 ms.
+
+This is the cleanest number in the experiment. No DOM work is involved on either
+side, so the difference is **React's runtime overhead for this workload**: running
+1000 component functions, allocating 1000 element objects, reconciling 1000
+fibers, plus scheduling and the `flushSync` the harness wraps every update in —
+versus a loop that compares 1000 strings.
+
+Worth being precise about what that figure is *not*. It is not "the cost of the
+virtual DOM" cleanly isolated, because the keyed-diff baseline is also
+reconciling. And some of it is `flushSync`, which the harness requires but a real
+app rarely uses. Treat it as an upper bound on the abstraction's cost here, not a
+line-item for any single mechanism.
+
+Note also that `React.memo` cannot help here. Every row object is new, so its
+shallow comparison fails on all 1000. Memoisation defends against re-renders, not
+against fresh object identity.
+
+### 7.3 The cost is time, not wasted DOM work
+
+| Update 1 row, N=1000 | script | total (script + forced layout) |
+| --- | --- | --- |
+| vanilla JS · targeted (was told what changed) | 0.00 ms | 0.60 ms |
+| vanilla JS · keyed diff (worked it out by hand) | 0.70 ms | 1.20 ms |
+| react key={row.id} (worked it out) | 1.70 ms | **2.30 ms** |
+| vanilla JS · rebuild (didn't bother) | 6.20 ms | **26.90 ms** |
+
+(`npm run standard` — 100 pooled samples per cell across two Chrome processes.)
+
+Same one-word change to the page. Targeted vanilla JS is effectively free. React
+takes ~1.70 ms of script, almost all of it render phase — re-running 1000
+component functions and comparing 1000 pairs of tree nodes to conclude that 999
+are unchanged.
+
+This measures the cost of the declarative programming model in this workload.
+You write "here is what the UI should look like" instead of "here is what to
+change". The keyed diff pays less for the same discovery job, but this experiment
+cannot divide the gap precisely among React's internal operations.
+
+Whether that is a good trade is a judgement call, not a measurement — but now it
+is a judgement call with a number attached. React beats the naive baseline by
+roughly **12×** on script + forced layout because rebuilding performs 2,000 DOM
+mutations and causes much broader layout invalidation.
+
+### 7.4 The swap result — the most interesting thing here
+
+| Swap 2 rows | ops | vs floor |
+| --- | --- | --- |
+| vanilla JS · targeted | 4 | ×1.00 |
+| **vanilla JS · keyed diff** | **1994** | **×498** |
+| react `key={row.id}` | **1994** | **×498** |
+| react `key={index}` | 6 | ×1.50 |
+
+Read that again. Swapping two rows with proper keys causes React to perform
+**1994 DOM operations** where 4 would do. And the "wrong" way — index keys, the
+thing every tutorial warns you about — does it almost perfectly.
+
+This is not a bug. It is a documented trade-off in React's reconciler, and the
+number tells you exactly what is happening.
+
+When React matches up an old list against a new one, it walks the new list
+keeping a high-water mark of the furthest-along old position it has reused so
+far. Any row whose old position is *behind* that mark gets moved.
+
+Our swap exchanges position 1 with position 998. So:
+
+- Position 0 → old row 0. Mark is now 0.
+- Position 1 → old row **998**. Mark jumps to 998.
+- Position 2 → old row 2. That's behind 998 → **move it**.
+- Position 3 → old row 3. Behind 998 → **move it**.
+- …and so on for every remaining row.
+
+997 rows get moved. A move is a remove plus an insert, so 997 × 2 = **1994** —
+matching the measurement exactly.
+
+**And the hand-written keyed diff does exactly the same thing — 1994, to the
+operation.** That is the most useful line in this table. It was written
+independently, without reference to React's implementation, and it lands on the
+identical number. This is not a React bug or a React design flaw; it is what a
+straightforward single-pass keyed diff *does*. Anyone reaching for "React's
+reconciler is naive here" has to explain why their own first attempt would be
+naive in precisely the same way.
+
+React chose a single fast pass over the list rather than computing the
+mathematically optimal set of moves. That choice is cheap and optimal for the
+common cases (adding to the end, removing, prepending) and terrible for this one.
+The experiment does not compare other reconciliation algorithms, so it cannot
+say whether another framework would choose fewer moves for this swap.
+
+### 7.5 Index keys invert the entire table
+
+| Scenario | `key={row.id}` | `key={index}` |
+| --- | --- | --- |
+| Insert at head | **1 op** | **3001 ops** |
+| Remove 1 row | **1 op** | **2995 ops** |
+| Swap 2 rows | **1994 ops** | **6 ops** |
+
+With proper keys, identity travels with the row: insert one at the front and
+React understands that every other row is still itself, just shifted. One
+operation.
+
+With index keys, identity is glued to the position: position 0 used to hold row A
+and now holds row B, so React rewrites it — and every position after it. That is
+1000 positions × 3 writes, plus one node appended at the end: 3001.
+
+That figure is worth a footnote. It read **3000** until the dataset was fixed —
+one operation short of what the mechanism predicts. The cause was a bug in the
+data generator: the prepended row was built with the same seed as the list, so it
+received the same label as row 0, and React correctly skipped a text write that
+would have been a no-op. One missing operation was a real signal that the inputs
+were wrong. See §8.5.
+
+And for a swap it is the reverse, for the same reason: a swap doesn't change
+*which positions exist*, only what sits in two of them, so the position-glued
+version has almost nothing to do.
+
+**But do not read that table as advice.** It says index keys are *faster* on a
+swap, and that is true, and it is not a reason to use them — because performance
+was never the axis keys are on.
+
+Keys tell React which row is which. Uncontrolled DOM state — what the user typed,
+focus, scroll position, text selection, video playback — lives on the DOM node,
+not in your data. With index keys React keeps the node where it is and rewrites
+its contents, so that state stays behind with the **position** while the data
+moves on without it.
+
+The **"Why keys exist"** panel at the bottom of the page demonstrates this. Put an
+input in each row, type into it, reorder. Measured from that panel, swapping the
+first and last of four rows:
+
+```text
+key={row.id}   Row D=typed-3   Row B=typed-1   Row C=typed-2   Row A=typed-0
+key={index}    Row D=typed-0   Row B=typed-1   Row C=typed-2   Row A=typed-3
+```
+
+Under `key={row.id}` the text follows its row. Under `key={index}` "Row D" now
+carries the text that was typed into Row A, because that text never moved — the
+label moved past it.
+
+Both lists render the same labels in the same order. A screenshot cannot tell
+them apart, and neither can an operation count. **The faster one is wrong.** This
+is why the benchmark needs the demo sitting next to it: op counts measure whether
+React did unnecessary work, and cannot see whether it did *correct* work.
+
+### 7.6 `React.memo` removes almost all of the discovery cost
+
+> **Historical / exploratory.** Single strategy order, earlier harness geometry.
+> These exact figures are not reproducible by any current command; the mechanism
+> is the point, not the decimals.
+
+Update 1 row out of 1000, with the `React.memo rows` checkbox off and on:
+
+| | render phase | total script |
+| --- | --- | --- |
+| without `React.memo` | 2.50 ms | 3.60 ms |
+| with `React.memo` | 0.60 ms | 0.70 ms |
+
+Without memoisation, React re-runs all 1000 row functions to find the one that
+changed. With it, 999 of them are skipped after a cheap props comparison. The DOM
+operation count is identical either way — this is purely about the render phase,
+which §7.2 identified as where the time goes.
+
+Roughly a 4× saving. Treat that as approximate: run-to-run variance on this
+machine is large enough that I have seen the same measurement land anywhere
+between 1.9 ms and 3.6 ms, so run it yourself rather than trusting one figure.
+
+> **A cautionary aside.** My first attempt at this comparison, taken with
+> `<Profiler>` still attached, reported 48.90 ms → 1.55 ms — a *thirty*-fold
+> saving. That was almost entirely an artifact. The profiler's overhead is paid
+> per rendered node, so it punished the un-memoised case (1000 nodes rendering)
+> enormously and the memoised case (999 skipped) barely at all. A broken
+> instrument does not just add noise; it can invent a finding that looks like
+> exactly the result you were hoping for. See §8.2.
+
+### 7.7 The re-render scope staircase — the result that changes how you write code
+
+> **Historical / exploratory.** Single strategy order, earlier harness geometry.
+> These exact figures are not reproducible by any current command; the mechanism
+> is the point, not the decimals.
+
+Everything above compares React against other implementations. This compares
+React against **itself**, and it is the finding with the most practical value.
+
+One change: update one label in a 1000-row list. Every variant produces **exactly
+1 DOM operation** and an identical screen.
+
+It is reported as **two tables**, because two variables move across the full set
+and merging them would smuggle one in as if it were the other.
+
+**Group A — same input as React.** All three receive the entire next-state array
+and have to locate the change in it. Only the re-render scope differs, so these
+rank against each other honestly:
+
+| Variant | script | total | What it is |
+| --- | --- | --- | --- |
+| `react · state at root` | 4.30 ms | 5.40 ms | the default you get for free |
+| `react · state at root + memo` | **0.70 ms** | **1.30 ms** | `React.memo` on the row |
+| `react · per-row subscription` | 0.70 ms | 1.60 ms | `useSyncExternalStore` per row |
+
+**Group B — target-addressed input.** These are handed the change already
+addressed to a row, so nothing is scanned. That is a **different information
+contract**, not merely a smaller re-render:
+
+| Variant | script | total | What it is |
+| --- | --- | --- | --- |
+| `react · subscription + targeted write` | **0.30 ms** | **0.90 ms** | models a signal-style targeted write |
+| `vanilla JS · targeted` | 0.00 ms | 0.50 ms | direct property write |
+
+Click **Scope staircase** to explore the same two groups under the current
+harness. The historical numbers above will not reproduce exactly.
+
+Reading the steps as decisions:
+
+- **Root → memo** is the big one, and it is a one-word change. Re-running 1000
+  component functions costs ~3.6 ms; comparing 1000 sets of props costs a
+  fraction of that.
+- **memo → per-row subscription** buys nothing. Both land at 0.70 ms script. The
+  sophisticated architecture is not automatically faster than the one-word fix —
+  which is the more useful thing to know.
+- **Crossing into Group B** is where the remaining cost goes, and it is not a
+  scope change. Handing a store a whole new array relocates the discovery problem
+  *into the store*; something still walks all N. Only a write that names its
+  target removes the scan.
+
+That last step required a hand-maintained dependency map so a write could find
+the readers that depend on it. Group B shows what becomes possible when updates
+are addressed rather than discovered. It does not measure another framework or
+prove that one architecture is a fixed multiple faster than React.
+
+The practical summary, which Group A supports on its own: many React performance
+techniques share one goal. **Shrink the amount of tree React has to re-check.**
+On the operations in §7.1, the DOM mutation set is already minimal; the remaining
+opportunity is reducing discovery work.
+
+> Measurement note: these figures need ~30 iterations to stabilise. At 8
+> iterations the bottom steps were indistinguishable and the top step read
+> anywhere from 1.6 to 8.7 ms. If you lower the iteration count, do not trust the
+> ordering.
+
+### 7.8 No crossover against rebuild in this sweep (exploratory)
+
+> **Historical / exploratory.** Single strategy order, earlier harness geometry,
+> N=1,000 only. These exact figures are not reproducible by any current command.
+
+Click **Density sweep**. It plots script + forced layout against how much of the list
+changed, from 0.1% to 100%. N = 1000, script | total in ms:
+
+| Strategy | 0.1% | 1% | 10% | 50% | 100% |
+| --- | --- | --- | --- | --- | --- |
+| vanilla JS · rebuild | 5.6 \| 23.9 | 4.5 \| 25.2 | 8.3 \| 44.4 | 4.2 \| 22.6 | 4.3 \| 24.1 |
+| vanilla JS · keyed diff | 0.3 \| 0.7 | 0.6 \| 1.2 | 0.4 \| 3.4 | 0.9 \| 6.4 | 1.3 \| 11.3 |
+| react · key={row.id} | 1.8 \| 2.2 | 3.1 \| 4.2 | 6.6 \| 10.5 | 2.0 \| 6.6 | 2.3 \| 10.7 |
+
+An earlier version reported a crossover at roughly 50%. That was an artifact of
+plotting script time only. In this historical run, rebuilding cost about 23–25 ms
+at most densities while React ranged from 2.2 to 10.7 ms and remained below it.
+
+The broad shape is the point:
+
+- **Rebuild has a large fixed component.** It performs the same replacement work
+  regardless of how much source data changed.
+- **React and the keyed diff generally rise with density**, although this run is
+  too noisy for fine-grained comparisons.
+
+This observation is exploratory and is not used as publication evidence. Its
+useful question is whether the framework overhead exceeds the browser work a
+more precise mutation path avoided.
+
+> This sweep is noisier than the scenario tables — the 10% column is visibly out
+> of line with its neighbours at 15 iterations. Raise the iteration count before
+> drawing fine-grained conclusions from it.
+
+### 7.9 React's additional cost did not scale strongly in this workload
+
+Seven kinds of DOM change, each at one row and every row, on the same list with
+the same data and the same CSS.
+
+The **Mutation matrix** button runs this, but with a single starting order — good
+for exploring, and it produces occasional single-cell outliers. The numbers below
+come from the balanced runner, which pools all 5 starting orders across 2 fresh
+Chrome processes (60 samples per cell):
+
+```bash
+npm run matrix     # ~6 minutes
+```
+
+The runner pins a 1440×900 viewport and asserts the measured container is fully
+visible before timing (that governs `e2e`; `script` and `layout` are forced
+synchronously and unaffected by scroll position). The two Chrome processes
+measure the 14 scenarios in opposite orders; strategy order rotates within every
+cell — 5 rotations, 60 pooled samples per cell. Raw samples and the run manifest
+sit next to the CSV.
+
+The "total" column — script + forced style/layout, in ms (paint, raster and compositing are outside it). N=1000:
+
+| Cell | floor ops | targeted | keyed diff | react | rebuild | **react − keyed** | **react − targeted** |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Text — 1 row | 1 | 0.60 | 1.30 | 2.40 | 26.65 | **+1.10** | **+1.80** |
+| Attribute — 1 row | 1 | 0.00 | 0.70 | 1.80 | 25.80 | **+1.10** | **+1.80** |
+| Class — 1 row | 1 | 0.10 | 0.80 | 1.90 | 26.00 | **+1.10** | **+1.80** |
+| Style — 1 row | 1 | 0.10 | 0.80 | 1.90 | 26.55 | **+1.10** | **+1.80** |
+| Conditional add — 1 row | 1 | 0.60 | 1.30 | 2.30 | 25.95 | **+1.00** | **+1.70** |
+| Conditional remove — 1 row | 1 | 0.60 | 1.30 | 2.70 | 34.60 | **+1.40** | **+2.10** |
+| Element type — 1 row | 2 | 0.70 | 1.30 | 2.40 | 25.15 | **+1.10** | **+1.70** |
+| Text — every row | 1000 | 12.40 | 13.00 | 14.00 | 28.40 | **+1.00** | **+1.60** |
+| Attribute — every row | 1000 | 0.50 | 1.00 | 2.40 | 25.90 | **+1.40** | **+1.90** |
+| Class — every row | 1000 | 4.65 | 5.20 | 5.55 | 25.30 | **+0.35** | **+0.90** |
+| Style — every row | 1000 | 3.70 | 4.30 | 5.20 | 25.30 | **+0.90** | **+1.50** |
+| Conditional add — every row | 1000 | 13.25 | 13.80 | 15.60 | 33.40 | **+1.80** | **+2.35** |
+| Conditional remove — every row | 1000 | 6.00 | 6.50 | 8.60 | 26.00 | **+2.10** | **+2.60** |
+| Element type — every row | 2000 | 15.90 | 16.25 | 18.40 | 25.45 | **+2.15** | **+2.50** |
+
+Read the two delta columns — they answer different questions.
+
+**react − keyed diff** is the like-for-like answer to "React versus plain
+JavaScript doing the same job": both receive the whole next-state array and must
+discover the change. The difference between React's broader update pipeline and
+the specialized keyed loop stays between +0.35 and +2.15 ms, median +1.10 ms.
+
+**react − targeted** is React's full cost above a pre-addressed direct write.
+This is a different information contract because targeted code is handed the
+change. The delta stays between +0.90 and +2.60 ms, median +1.80 ms.
+
+Four separate runs on the same machine (not independent replications) agree:
+earlier runs gave react−targeted medians of +1.9, +1.9 and +2.3 ms; this one
+gives +1.80 ms. Treat the observed range across runs — a few tenths of a
+millisecond — as the honest uncertainty. Within this run, the two Chrome
+processes measured the scenarios in opposite orders and still agree: forward
+order +1.72 ms, reverse order +1.90 ms (median across cells of per-process
+medians). p95 columns describe tail latency of individual updates, not
+confidence in the medians.
+
+That is the result. React still performs and pays for every required DOM mutation.
+Its incremental premium did not scale strongly with mutation count or category
+in this workload. The pattern is consistent with per-update render and
+reconciliation work, but the harness does not prove that the cost is constant or
+assign it to one internal mechanism.
+
+Stated carefully, because it is a claim about this workload and not a law of
+nature:
+
+> For this 1000-row, non-memoized tree, React's full update pipeline stayed a
+> small, millisecond-scale amount above both hand-written baselines across the
+> matrix. The experiment does not isolate that premium to one React mechanism.
+
+**Why ratios are the wrong lens here.** An earlier version of this section led
+with `react ÷ targeted` and claimed sparse changes cost 4–19× while dense changes
+cost 1.0–1.5×. That framing was wrong twice over. It was arithmetically fragile —
+`attribute — 1 row` has a targeted median of 0.00 ms, making the ratio infinite,
+and 0.1 ms denominators turn a 1.8 ms constant into a "19×" headline. And it
+described the denominator, not React. The ratio is large exactly when the
+alternative was cheap, which is a fact about attribute writes, not about
+reconciliation.
+
+`Attribute — every row` is the cell that proves it: 1000 changed rows, yet
+targeted finishes in 0.50 ms because an attribute that no CSS rule consumes
+triggers no layout at all. React's premium there is +1.90 ms, close to the
++1.80 ms median — but as a ratio it looks enormous, which under the old framing was
+an "exception" to a rule that never existed. Ratios describe the denominator.
+
+Ratios in this document are suppressed wherever the denominator falls below
+0.5 ms, which is the practical noise floor of `performance.now()` medians here.
+
+Every strategy hit the mutation floor exactly in all 14 cells, React included —
+verified by `scripts/verify-fairness.js`, which asserts equality rather than
+merely "not better than".
+
+### 7.10 Hypotheses, and the two that were wrong
+
+The predictions below were written down before the matrix ran, which is the only
+reason it is possible to state this cleanly.
+
+| Prediction | Outcome |
+| --- | --- |
+| Text/attribute/class: React matches the floor, pays discovery | ✅ held |
+| **Style: React pays extra for its per-property style diff** | ❌ **not detected** |
+| Conditional add: modest additional React cost | ✅ held (+1.70 ms, close to text at +1.80 ms) |
+| **Conditional remove costs more than add** | ➖ **held in direction at both densities, but too small to call** |
+| **Element-type-all is React's worst result in the project** | ❌ **wrong** |
+
+**Style.** I predicted React's property-by-property style diffing would be the
+first place the mutation-kind axis showed a real cost. Its premium is +1.80 ms at
+one row and +1.50 ms at every row — indistinguishable from text (+1.80 and
++1.60). Phrased as
+precisely as the data supports: *no additional style-diff cost was detected in
+this single-property workload.* That is not the same as "React's style diffing is
+free" — a change touching many properties at once might well behave differently,
+and this experiment does not test that.
+
+**Conditional remove vs add.** Not established. Across four runs the direction
+was unstable, and until this run every process measured the scenarios in the
+same order — with badgeRemove always after badgeAdd, warm-up drift was
+confounded with exactly this comparison. In the current run, with the two
+processes measuring in opposite orders, the premiums are add +1.70/+2.35 and
+remove +2.10/+2.60 (one row / every row) — differences of a few tenths of a
+millisecond, below what this setup resolves. With no effects mounted on the
+child, the only additional mechanism under test is fiber-deletion bookkeeping.
+Treat the timing difference as suggestive, not established. No
+`useEffect` was added to make it look bigger; that would have changed the axis
+from mutation kind to component lifecycle.
+
+**Element type.** I predicted 1000 subtrees discarded and rebuilt would be
+React's worst showing anywhere. Its premium is +2.50 ms — near the top of the
+range, and nowhere near the catastrophe predicted. Rebuilding 1000 subtrees is
+expensive for *everyone* (targeted pays 15.90 ms), and React's total premium
+remains within the range measured in §7.9.
+
+> An earlier run reported `keyed diff` on conditional-add-every-row at 32.40 ms
+> against targeted's 13.80 ms, and this document flagged it as unexplained. It
+> did not reproduce: the balanced run gives 13.70 vs 13.95. It was measurement
+> noise, and publishing it as an anomaly was a mistake — a single unreplicated
+> outlier is not a finding. That is what the rotation pooling and multi-process
+> repeats now exist to prevent.
+
+## 8. Traps found while building this
+
+These are worth reading even if you never run the code, because they are the
+reasons most casual framework benchmarks on the internet are wrong.
+
+### 8.1 `setState` does not do the work when you call it
+
+React 18 and later schedule updates rather than performing them immediately. So
+this measures nothing:
+
+```js
+const t0 = performance.now()
+setState(newData)                 // ← schedules; returns immediately
+const t1 = performance.now()      // ← the update hasn't happened yet
+```
+
+Every update here is wrapped in `flushSync()` to force the work to complete
+inside the timer.
+
+### 8.2 React's Profiler distorted this microbenchmark
+
+The obvious way to split "render" from "commit" is React's `<Profiler>`
+component. I tried it. Same build, same update, the only difference being the
+wrapper:
+
+| | measured time | `<Profiler>` reported |
+| --- | --- | --- |
+| without `<Profiler>` | **3.25 ms** | — |
+| with `<Profiler>` | **32.65 ms** | 2.00 ms |
+
+`<Profiler>` records a timestamp for every node in the tree as React enters and
+leaves it — roughly 8000 timing calls for a 1000-row list. It made the update
+**ten times slower than the thing it was measuring**, and then reported a render
+time of 2 ms, which invites you to conclude that the other 30 ms was the commit
+phase. It wasn't. It was the profiler.
+
+The fix: one invisible marker component placed last in the list. Its function body
+runs at the end of the render phase; its layout effect runs at the end of the
+commit phase. Two timestamps instead of eight thousand, and it renders nothing so
+the DOM stays identical.
+
+### 8.3 A floor that gets beaten is a bug, not a finding
+
+I declared the Replace-All floor as 3N: rewrite each row in place, costing an id
+text write, a label text write and a `data-id` attribute write. Then two
+strategies came in at 2N and the table showed `×0.67`.
+
+Rewriting in place is not the cheapest option. Throwing the node away and
+building a new one costs 2 operations, not 3. The floor is 2N.
+
+The scenario keeps an instructive detail after the fix: targeted vanilla JS still
+takes the 3N route and is **not** the slowest — it does 50% more operations than
+the rebuild strategy and, depending on the run, finishes in comparable time. Text writes are
+cheap; creating and destroying nodes is not. Operation counts and time are
+different rulers, and this is the scenario that proves they can disagree.
+
+### 8.4 The measuring instrument was inside the measurement
+
+Attaching the MutationObserver costs 0.2–0.7 ms depending on scenario. In
+absolute terms that is nothing. As a fraction of React's update-one-row time —
+1.8 ms without it, 2.3 ms with — it is around 25%, landing squarely on the
+headline number.
+
+Counting and timing now happen in separate passes. The op-count pass runs 3
+iterations, because a count is not a sample.
+
+### 8.5 The benchmark's own data was flattering somebody
+
+"Replace all rows" generated its before and after datasets like this:
+
+```js
+const rows  = makeRows(n)
+const fresh = makeRows(n)   // same default seed
+```
+
+Ids differed, but the label sequence was **identical**, so "entirely new data"
+was false — every label was written back to its own value. That quietly changed
+the scenario for anyone comparing text, and it hid one operation in an unrelated
+scenario (§7.5). Seeds are now explicit and their id ranges disjoint.
+
+Related: row ids came from a module-global counter, so run 2 never used the same
+data as run 1. Ids are now derived from the seed, and a run is byte-identical to
+the one before it.
+
+The general lesson is that a benchmark's inputs deserve the same suspicion as its
+timers. Both of these were found by an operation count being off by one.
+
+### 8.6 The floor has to be as clever as React
+
+There are two ways to change a piece of text:
+
+```js
+el.textContent = 'new'              // replaces the text node: 2 operations
+el.firstChild.nodeValue = 'new'     // edits it in place:      1 operation
+```
+
+React uses the second. If targeted vanilla JS had used the first, it would have scored
+*worse* than React on every update scenario, and the "floor" would have been
+above the thing it was supposed to be beneath.
+
+### 8.7 Development builds are not comparable here
+
+React's development build carries warnings, validation and extra bookkeeping and
+is several times slower. Any benchmark that forgets this is measuring the safety
+checks. Hence `npm run measure` building first, and the red banner if you don't.
+
+---
+
+## 9. What this does not measure
+
+Being explicit, so nothing here gets over-claimed:
+
+- **Bundle size and startup.** React adds dependency bytes, parse time, and boot
+  work before it renders anything. Those costs are real but not measured here.
+- **Deep or complex trees.** This is a flat list of simple rows. Real apps have
+  nesting, context, state spread across components.
+- **Anything about developer experience**, which is the actual reason people use
+  React and is not a thing a stopwatch can answer.
+- **Other frameworks.** Svelte, Vue and Solid make different trade-offs; see the
+  prior art below. The Group B row in §7.7 *models* a signal-style write; it is
+  not a signals framework and should not be read as one.
+- **Realistic React scheduling.** Every React update here is wrapped in
+  `flushSync`, which is required to attribute time correctly but is not how React
+  updates in production. Concurrent scheduling, batching and time-slicing are all
+  bypassed. The `e2e` column is the closest thing here to a scheduling-inclusive
+  number, and it is frame-quantised.
+- **Mobile hardware.** The published datasets are desktop results. Use
+  `--throttle 4` or DevTools CPU throttling to explore slower hardware rather
+  than extrapolating the desktop ratios.
+
+---
+
+## 10. Prior art
+
+This experiment is small and focused on mechanism. If you want breadth:
+
+- **[js-framework-benchmark](https://github.com/krausest/js-framework-benchmark)**
+  — Stefan Krause's benchmark, running since 2016, with vanilla JS as a baseline.
+  The scenarios in §4 are deliberately modelled on its operations so you can
+  cross-check against its published, dated result tables.
+- **[Speedometer 3](https://browserbench.org/Speedometer3.0/)** — a joint
+  Apple/Google/Mozilla benchmark. The most methodologically careful thing in this
+  space, since browser vendors audit each other's setup.
+- **[Rich Harris, "Virtual DOM is pure overhead"](https://svelte.dev/blog/virtual-dom-is-pure-overhead)**
+  (2018) — the essay arguing that diffing is a cost you pay for ergonomics rather
+  than a performance feature. §7.2 is essentially a measurement of his argument.
+
+---
+
+## 11. File map
+
+```text
+src/
+  main.jsx                        the page: controls, results tables, density chart
+  runner.js                       the measurement loop
+  measure.js                      MutationObserver counting, medians/p95, forced layout
+  scenarios.js                    standard scenarios and mutation matrix plans
+  data.js                         deterministic row generation (same data every run)
+  KeysDemo.jsx                    the correctness demo: why op counts cannot see keys
+  strategies/
+    react.jsx                     React, keyed + index-keyed, with the marker fiber
+    reactStore.jsx                per-row subscriptions + targeted writes (staircase)
+    vanillaInnerHTML.js           vanilla JS, rebuild
+    vanillaKeyedDiff.js           vanilla JS, keyed diff — the fair comparison
+    vanillaSurgical.js            vanilla JS, targeted
+scripts/
+  headless.js                     scripted runs with CPU throttling and CSV output
+                                  (--matrix runs the mutation matrix)
+  chrome.js                       Chrome/Chromium discovery and CHROME_BIN handling
+  verify.js                       build, fairness, and headless smoke gate
+  verify-fairness.js              validity gate: identical DOM, floor compliance,
+                                  and proof the keyed diff inspected every field
+results-n1000.*                   standard CSV, raw samples, and environment manifest
+results-matrix-n1000.*            matrix CSV, raw samples, and environment manifest
+vite.config.js                    production build config; the profiling cross-check
+```
+
+The publication datasets can be regenerated with:
+
+```bash
+npm run standard       # standard scenarios: CSV + raw samples + manifest
+npm run matrix         # mutation matrix: CSV + raw samples + manifest
+```
+
+Each manifest records the exact command, environment, sample count, viewport,
+and scenario order used for its CSV. Sections §7.6–§7.8 contain historical
+exploratory observations and cannot reproduce their original numbers under the
+current harness.

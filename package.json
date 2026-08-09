@@ -1,0 +1,32 @@
+{
+  "name": "react-vs-vanilla-js-dom",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "measure": "vite build && vite preview --port 4173",
+    "measure:profiler": "PROFILING=1 vite build && vite preview --port 4173",
+    "headless": "vite build && node scripts/headless.js",
+    "verify": "node scripts/verify.js",
+    "matrix": "vite build && node scripts/headless.js --matrix --rotations 5 --repeat 2 --iterations 6 --rows 1000 --csv results-matrix-n1000.csv",
+    "standard": "vite build && node scripts/headless.js --rows 1000 --iterations 10 --rotations 5 --repeat 2 --csv results-n1000.csv"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Minimal experiment dissecting where React's virtual DOM time actually goes.",
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.5",
+    "puppeteer-core": "^25.5.0",
+    "vite": "^8.2.1"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
