@@ -1,4 +1,4 @@
-# Virtual DOM dissection
+# React vs vanilla JS DOM - Virtual DOM is not a faster DOM
 
 A small experiment that answers one question with actual measurements:
 
